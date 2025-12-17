@@ -9,14 +9,53 @@ import Cocoa
 import CoreAudio
 import AudioToolbox
 import Accelerate
+import ScreenCaptureKit
+
+// MARK: - Audio Capture Protocol
+
+protocol AudioCaptureProvider {
+    var onAudioData: ((_ buffer: UnsafePointer<Float>, _ frameCount: UInt32) -> Void)? { get set }
+    var sampleRate: Double { get }
+    var channelCount: UInt32 { get }
+    func start(completion: @escaping (Error?) -> Void)
+    func stop()
+}
+
+// MARK: - Audio Capture Method
+
+enum AudioCaptureMethod: Int, CaseIterable {
+    case screenCaptureKit = 0
+    case blackHoleVirtualDevice = 1
+    
+    var displayName: String {
+        switch self {
+        case .screenCaptureKit:
+            return "ScreenCaptureKit (Recommended)"
+        case .blackHoleVirtualDevice:
+            return "BlackHole Virtual Device"
+        }
+    }
+    
+    var description: String {
+        switch self {
+        case .screenCaptureKit:
+            return "Uses macOS built-in system audio capture (macOS 13+)"
+        case .blackHoleVirtualDevice:
+            return "Uses BlackHole virtual audio device"
+        }
+    }
+}
 
 class ViewController: NSViewController {
     
-    private var audioCapture: BlackHoleAudioCapture?
+    private var audioCapture: AudioCaptureProvider?
+    private var currentMethod: AudioCaptureMethod = .screenCaptureKit
     
     private var startButton: NSButton!
     private var stopButton: NSButton!
     private var spectrumView: SpectrumView!
+    private var methodPopup: NSPopUpButton!
+    private var methodDescriptionLabel: NSTextField!
 
     override func viewDidLoad() {
         super.viewDidLoad()
@@ -24,8 +63,30 @@ class ViewController: NSViewController {
         // 设置界面
         setupUI()
         
-        // 初始化音频捕获
-        audioCapture = BlackHoleAudioCapture()
+        // 初始化音频捕获（默认使用 ScreenCaptureKit）
+        setupAudioCapture(method: currentMethod)
+    }
+    
+    private func setupAudioCapture(method: AudioCaptureMethod) {
+        // 停止现有捕获
+        audioCapture?.stop()
+        
+        // 根据选择的方法创建捕获器
+        switch method {
+        case .screenCaptureKit:
+            if #available(macOS 13.0, *) {
+                audioCapture = ScreenCaptureKitAudioCapture()
+            } else {
+                // 如果系统版本不支持，回退到 BlackHole
+                showAlert(title: "ScreenCaptureKit Not Available",
+                         message: "ScreenCaptureKit requires macOS 13.0 or later. Falling back to BlackHole.")
+                audioCapture = BlackHoleAudioCapture()
+                currentMethod = .blackHoleVirtualDevice
+                methodPopup.selectItem(at: currentMethod.rawValue)
+            }
+        case .blackHoleVirtualDevice:
+            audioCapture = BlackHoleAudioCapture()
+        }
         
         // 设置音频数据回调
         audioCapture?.onAudioData = { [weak self] buffer, frameCount in
@@ -71,6 +132,9 @@ class ViewController: NSViewController {
                 self.spectrumView.updateSpectrum(with: monoData)
             }
         }
+        
+        // 更新描述标签
+        methodDescriptionLabel?.stringValue = method.description
     }
     
     private func setupUI() {
@@ -88,27 +152,61 @@ class ViewController: NSViewController {
         spectrumView.setContentCompressionResistancePriority(.defaultLow, for: .vertical)
         view.addSubview(spectrumView)
         
-        // 创建按钮容器视图
-        let buttonContainer = NSView()
-        buttonContainer.translatesAutoresizingMaskIntoConstraints = false
-        // 设置高压缩阻力，确保按钮区域不被压缩
-        buttonContainer.setContentCompressionResistancePriority(.required, for: .vertical)
-        view.addSubview(buttonContainer)
+        // 创建控制容器视图
+        let controlContainer = NSView()
+        controlContainer.translatesAutoresizingMaskIntoConstraints = false
+        controlContainer.setContentCompressionResistancePriority(.required, for: .vertical)
+        view.addSubview(controlContainer)
+        
+        // 创建方法选择标签
+        let methodLabel = NSTextField(labelWithString: "Capture Method:")
+        methodLabel.translatesAutoresizingMaskIntoConstraints = false
+        methodLabel.font = NSFont.systemFont(ofSize: 13, weight: .medium)
+        controlContainer.addSubview(methodLabel)
+        
+        // 创建方法选择下拉菜单
+        methodPopup = NSPopUpButton()
+        methodPopup.translatesAutoresizingMaskIntoConstraints = false
+        for method in AudioCaptureMethod.allCases {
+            methodPopup.addItem(withTitle: method.displayName)
+        }
+        methodPopup.selectItem(at: currentMethod.rawValue)
+        methodPopup.target = self
+        methodPopup.action = #selector(captureMethodChanged(_:))
+        controlContainer.addSubview(methodPopup)
+        
+        // 创建方法描述标签
+        methodDescriptionLabel = NSTextField(labelWithString: currentMethod.description)
+        methodDescriptionLabel.translatesAutoresizingMaskIntoConstraints = false
+        methodDescriptionLabel.font = NSFont.systemFont(ofSize: 11)
+        methodDescriptionLabel.textColor = .secondaryLabelColor
+        controlContainer.addSubview(methodDescriptionLabel)
+        
+        // 创建分隔线
+        let separator = NSBox()
+        separator.boxType = .separator
+        separator.translatesAutoresizingMaskIntoConstraints = false
+        controlContainer.addSubview(separator)
+        
+        // 创建按钮容器
+        let buttonStack = NSStackView()
+        buttonStack.translatesAutoresizingMaskIntoConstraints = false
+        buttonStack.orientation = .horizontal
+        buttonStack.spacing = 12
+        controlContainer.addSubview(buttonStack)
         
         // 创建 Start 按钮
         startButton = NSButton(title: "Start Capture", target: self, action: #selector(startCapture(_:)))
         startButton.bezelStyle = .rounded
-        startButton.translatesAutoresizingMaskIntoConstraints = false
         startButton.setContentHuggingPriority(.required, for: .vertical)
-        buttonContainer.addSubview(startButton)
+        buttonStack.addArrangedSubview(startButton)
         
         // 创建 Stop 按钮
         stopButton = NSButton(title: "Stop Capture", target: self, action: #selector(stopCapture(_:)))
         stopButton.bezelStyle = .rounded
-        stopButton.translatesAutoresizingMaskIntoConstraints = false
         stopButton.isEnabled = false // 初始禁用
         stopButton.setContentHuggingPriority(.required, for: .vertical)
-        buttonContainer.addSubview(stopButton)
+        buttonStack.addArrangedSubview(stopButton)
         
         // 设置约束
         NSLayoutConstraint.activate([
@@ -119,23 +217,35 @@ class ViewController: NSViewController {
             // 最小高度约束
             spectrumView.heightAnchor.constraint(greaterThanOrEqualToConstant: 100),
             
-            // 按钮容器在底部，固定高度
-            buttonContainer.topAnchor.constraint(equalTo: spectrumView.bottomAnchor, constant: 20),
-            buttonContainer.leadingAnchor.constraint(equalTo: view.leadingAnchor, constant: 20),
-            buttonContainer.trailingAnchor.constraint(equalTo: view.trailingAnchor, constant: -20),
-            buttonContainer.bottomAnchor.constraint(equalTo: view.bottomAnchor, constant: -20),
-            // 按钮容器固定高度
-            buttonContainer.heightAnchor.constraint(equalToConstant: 80),
+            // 控制容器在底部
+            controlContainer.topAnchor.constraint(equalTo: spectrumView.bottomAnchor, constant: 20),
+            controlContainer.leadingAnchor.constraint(equalTo: view.leadingAnchor, constant: 20),
+            controlContainer.trailingAnchor.constraint(equalTo: view.trailingAnchor, constant: -20),
+            controlContainer.bottomAnchor.constraint(equalTo: view.bottomAnchor, constant: -20),
             
-            // Start 按钮在容器顶部居中
-            startButton.centerXAnchor.constraint(equalTo: buttonContainer.centerXAnchor),
-            startButton.topAnchor.constraint(equalTo: buttonContainer.topAnchor),
-            startButton.widthAnchor.constraint(greaterThanOrEqualToConstant: 120),
+            // 方法选择标签
+            methodLabel.topAnchor.constraint(equalTo: controlContainer.topAnchor),
+            methodLabel.leadingAnchor.constraint(equalTo: controlContainer.leadingAnchor),
             
-            // Stop 按钮在 Start 按钮下方居中
-            stopButton.centerXAnchor.constraint(equalTo: buttonContainer.centerXAnchor),
-            stopButton.topAnchor.constraint(equalTo: startButton.bottomAnchor, constant: 10),
-            stopButton.widthAnchor.constraint(greaterThanOrEqualToConstant: 120)
+            // 方法选择下拉菜单
+            methodPopup.centerYAnchor.constraint(equalTo: methodLabel.centerYAnchor),
+            methodPopup.leadingAnchor.constraint(equalTo: methodLabel.trailingAnchor, constant: 8),
+            methodPopup.widthAnchor.constraint(greaterThanOrEqualToConstant: 220),
+            
+            // 方法描述标签
+            methodDescriptionLabel.topAnchor.constraint(equalTo: methodLabel.bottomAnchor, constant: 4),
+            methodDescriptionLabel.leadingAnchor.constraint(equalTo: controlContainer.leadingAnchor),
+            methodDescriptionLabel.trailingAnchor.constraint(equalTo: controlContainer.trailingAnchor),
+            
+            // 分隔线
+            separator.topAnchor.constraint(equalTo: methodDescriptionLabel.bottomAnchor, constant: 12),
+            separator.leadingAnchor.constraint(equalTo: controlContainer.leadingAnchor),
+            separator.trailingAnchor.constraint(equalTo: controlContainer.trailingAnchor),
+            
+            // 按钮容器
+            buttonStack.topAnchor.constraint(equalTo: separator.bottomAnchor, constant: 12),
+            buttonStack.centerXAnchor.constraint(equalTo: controlContainer.centerXAnchor),
+            buttonStack.bottomAnchor.constraint(equalTo: controlContainer.bottomAnchor)
         ])
     }
     
@@ -145,24 +255,48 @@ class ViewController: NSViewController {
         spectrumView.needsDisplay = true
     }
     
+    @objc private func captureMethodChanged(_ sender: NSPopUpButton) {
+        guard let newMethod = AudioCaptureMethod(rawValue: sender.indexOfSelectedItem) else { return }
+        
+        // 如果正在捕获，先停止
+        let wasCapturing = !startButton.isEnabled
+        if wasCapturing {
+            stopCapture(sender)
+        }
+        
+        currentMethod = newMethod
+        setupAudioCapture(method: newMethod)
+        
+        // 更新描述
+        methodDescriptionLabel.stringValue = newMethod.description
+    }
+    
     @IBAction func startCapture(_ sender: Any) {
-        do {
-            try audioCapture?.start()
-            print("Audio capture started")
-            
-            // 更新按钮状态
-            startButton.isEnabled = false
-            stopButton.isEnabled = true
-        } catch {
-            print("Failed to start capture: \(error)")
-            
-            // 显示错误提示
-            let alert = NSAlert()
-            alert.messageText = "Failed to Start Capture"
-            alert.informativeText = error.localizedDescription
-            alert.alertStyle = .warning
-            alert.addButton(withTitle: "OK")
-            alert.runModal()
+        // 禁用按钮，防止重复点击
+        startButton.isEnabled = false
+        methodPopup.isEnabled = false
+        
+        // 使用异步方式启动捕获
+        audioCapture?.start { [weak self] error in
+            DispatchQueue.main.async {
+                guard let self = self else { return }
+                
+                if let error = error {
+                    print("Failed to start capture: \(error)")
+                    
+                    // 恢复按钮状态
+                    self.startButton.isEnabled = true
+                    self.methodPopup.isEnabled = true
+                    
+                    // 显示错误提示
+                    self.showAlert(title: "Failed to Start Capture", message: error.localizedDescription)
+                } else {
+                    print("Audio capture started using \(self.currentMethod.displayName)")
+                    
+                    // 更新按钮状态
+                    self.stopButton.isEnabled = true
+                }
+            }
         }
     }
     
@@ -173,9 +307,19 @@ class ViewController: NSViewController {
         // 更新按钮状态
         startButton.isEnabled = true
         stopButton.isEnabled = false
+        methodPopup.isEnabled = true // 停止后允许切换方法
         
         // 清除频谱显示
         spectrumView.clearSpectrum()
+    }
+    
+    private func showAlert(title: String, message: String) {
+        let alert = NSAlert()
+        alert.messageText = title
+        alert.informativeText = message
+        alert.alertStyle = .warning
+        alert.addButton(withTitle: "OK")
+        alert.runModal()
     }
 
     override var representedObject: Any? {
@@ -404,9 +548,164 @@ class SpectrumView: NSView {
     }
 }
 
+// MARK: - ScreenCaptureKit Audio Capture
+
+@available(macOS 13.0, *)
+class ScreenCaptureKitAudioCapture: NSObject, AudioCaptureProvider, SCStreamDelegate, SCStreamOutput {
+    
+    private var stream: SCStream?
+    private var streamConfiguration: SCStreamConfiguration?
+    
+    /// 音频数据回调
+    var onAudioData: ((_ buffer: UnsafePointer<Float>, _ frameCount: UInt32) -> Void)?
+    
+    /// 音频格式信息
+    private(set) var sampleRate: Double = 48000.0
+    private(set) var channelCount: UInt32 = 2
+    
+    override init() {
+        super.init()
+    }
+    
+    deinit {
+        stop()
+    }
+    
+    // MARK: - AudioCaptureProvider
+    
+    func start(completion: @escaping (Error?) -> Void) {
+        Task {
+            do {
+                try await startAsync()
+                completion(nil)
+            } catch {
+                completion(error)
+            }
+        }
+    }
+    
+    private func startAsync() async throws {
+        // 获取可共享内容
+        let content = try await SCShareableContent.excludingDesktopWindows(false, onScreenWindowsOnly: false)
+        
+        // 获取主显示器（我们只需要音频，但需要指定一个显示器）
+        guard let display = content.displays.first else {
+            throw ScreenCaptureError.noDisplayFound
+        }
+        
+        // 创建内容过滤器 - 捕获整个显示器（包括系统音频）
+        let filter = SCContentFilter(display: display, excludingWindows: [])
+        
+        // 配置流
+        let configuration = SCStreamConfiguration()
+        
+        // 禁用视频捕获（我们只需要音频）
+        configuration.width = 2
+        configuration.height = 2
+        configuration.minimumFrameInterval = CMTime(value: 1, timescale: 1) // 最低帧率
+        
+        // 启用音频捕获
+        configuration.capturesAudio = true
+        configuration.excludesCurrentProcessAudio = true // 排除当前应用的音频，避免反馈
+        configuration.sampleRate = Int(sampleRate)
+        configuration.channelCount = Int(channelCount)
+        
+        self.streamConfiguration = configuration
+        
+        // 创建流
+        let stream = SCStream(filter: filter, configuration: configuration, delegate: self)
+        self.stream = stream
+        
+        // 添加音频输出
+        try stream.addStreamOutput(self, type: .audio, sampleHandlerQueue: DispatchQueue(label: "com.medialingo.screencapture.audio"))
+        
+        // 开始捕获
+        try await stream.startCapture()
+        
+        print("ScreenCaptureKit audio capture started")
+    }
+    
+    func stop() {
+        guard let stream = stream else { return }
+        
+        Task {
+            do {
+                try await stream.stopCapture()
+                print("ScreenCaptureKit audio capture stopped")
+            } catch {
+                print("Error stopping capture: \(error)")
+            }
+        }
+        
+        self.stream = nil
+    }
+    
+    // MARK: - SCStreamOutput
+    
+    func stream(_ stream: SCStream, didOutputSampleBuffer sampleBuffer: CMSampleBuffer, of type: SCStreamOutputType) {
+        guard type == .audio else { return }
+        
+        // 获取音频格式
+        guard let formatDescription = sampleBuffer.formatDescription else { return }
+        let audioFormat = CMAudioFormatDescriptionGetStreamBasicDescription(formatDescription)?.pointee
+        
+        if let format = audioFormat {
+            // 更新采样率和通道数
+            if format.mSampleRate != sampleRate {
+                sampleRate = format.mSampleRate
+            }
+            if format.mChannelsPerFrame != channelCount {
+                channelCount = format.mChannelsPerFrame
+            }
+        }
+        
+        // 获取音频数据
+        guard let blockBuffer = sampleBuffer.dataBuffer else { return }
+        
+        var length = 0
+        var dataPointer: UnsafeMutablePointer<Int8>?
+        
+        let status = CMBlockBufferGetDataPointer(blockBuffer, atOffset: 0, lengthAtOffsetOut: nil, totalLengthOut: &length, dataPointerOut: &dataPointer)
+        
+        guard status == kCMBlockBufferNoErr, let data = dataPointer else { return }
+        
+        // 转换为 Float 数据
+        let frameCount = length / (Int(channelCount) * MemoryLayout<Float>.size)
+        
+        data.withMemoryRebound(to: Float.self, capacity: frameCount * Int(channelCount)) { floatPointer in
+            onAudioData?(floatPointer, UInt32(frameCount))
+        }
+    }
+    
+    // MARK: - SCStreamDelegate
+    
+    func stream(_ stream: SCStream, didStopWithError error: Error) {
+        print("ScreenCaptureKit stream stopped with error: \(error)")
+    }
+}
+
+// MARK: - ScreenCaptureKit Errors
+
+enum ScreenCaptureError: Error, LocalizedError {
+    case noDisplayFound
+    case permissionDenied
+    case captureStartFailed
+    
+    var errorDescription: String? {
+        switch self {
+        case .noDisplayFound:
+            return "No display found for screen capture"
+        case .permissionDenied:
+            return "Screen recording permission denied. Please enable it in System Settings > Privacy & Security > Screen Recording"
+        case .captureStartFailed:
+            return "Failed to start screen capture"
+        }
+    }
+}
+
 // MARK: - BlackHole Audio Capture API
 
-class BlackHoleAudioCapture {
+class BlackHoleAudioCapture: AudioCaptureProvider {
     
     fileprivate var audioUnit: AudioComponentInstance?
     private var blackHoleDeviceID: AudioDeviceID = kAudioObjectUnknown
@@ -434,16 +733,22 @@ class BlackHoleAudioCapture {
     // MARK: - Public Methods
     
     /// 开始捕获音频
-    func start() throws {
-        guard blackHoleDeviceID != kAudioObjectUnknown else {
-            throw AudioCaptureError.deviceNotFound
-        }
-        
-        try setupAudioUnit()
-        
-        let status = AudioOutputUnitStart(audioUnit!)
-        guard status == noErr else {
-            throw AudioCaptureError.startFailed(status)
+    func start(completion: @escaping (Error?) -> Void) {
+        do {
+            guard blackHoleDeviceID != kAudioObjectUnknown else {
+                throw AudioCaptureError.deviceNotFound
+            }
+            
+            try setupAudioUnit()
+            
+            let status = AudioOutputUnitStart(audioUnit!)
+            guard status == noErr else {
+                throw AudioCaptureError.startFailed(status)
+            }
+            
+            completion(nil)
+        } catch {
+            completion(error)
         }
     }
     
